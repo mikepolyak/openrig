@@ -10,7 +10,7 @@ import { prepareHerdrLaunchConfig } from "./herdr-launch-config.js";
 import { openRexView } from "./terminal-window-rex.js";
 import type { FollowControls, OpenViewResult } from "./commands/terminal.js";
 
-interface Pane { seat: string; label: string; paneCommand: string; recoveryCommand?: string }
+interface Pane { seat: string; label: string; paneCommand: string; recoveryCommand?: string; recoveryArgv?: string[] }
 interface HerdrTab { workspace_id: string; tab_id: string; label: string }
 interface Preview {
   planId: string;
@@ -209,32 +209,73 @@ function failure(provider: string, error: string): OpenViewResult {
   return { provider, ok: false, opened: [], absent: [], degraded: [], pages: 0, error, code: "terminal_window_failed" };
 }
 
+/** Match the composer's display quoting without evaluating a command from the preview. */
+function attachQuote(value: string): string {
+  return "'" + value.replace(/'/g, "'\"'\"'") + "'";
+}
+
+async function attachedPanes(pages: Pane[][], deps: WindowDeps): Promise<Map<string, Set<Pane>> | undefined> {
+  const inventories = new Map<string, string>();
+  const clients = new Map<string, Set<Pane>>();
+  let legacyTmux: string | undefined;
+  for (const pane of pages.flat()) {
+    const argv = pane.recoveryArgv;
+    let tmux: string;
+    let server: string[] = [];
+    if (argv === undefined) {
+      // Older previews only supply a command string. They can prove a default-server attach.
+      legacyTmux ??= (await deps.exec("/bin/sh", ["-c", "command -v tmux"])).trim();
+      if (!path.isAbsolute(legacyTmux)) return undefined;
+      tmux = legacyTmux;
+    } else {
+      if (!Array.isArray(argv) || !argv.every(arg => typeof arg === "string")) return undefined;
+      tmux = argv[0] ?? "";
+      if (tmux !== "tmux" && (!path.isAbsolute(tmux) || path.basename(tmux) !== "tmux")) return undefined;
+      if (argv[1] === "-S" || argv[1] === "-L") {
+        if (!argv[2] || (argv[1] === "-S" && !path.isAbsolute(argv[2]))) return undefined;
+        server = argv.slice(1, 3);
+      }
+      if (argv[1 + server.length] !== "attach") return undefined;
+    }
+
+    const key = JSON.stringify([tmux, ...server]);
+    if (!inventories.has(key)) {
+      inventories.set(key, await deps.exec(tmux, [...server, "list-clients", "-F", "#{client_pid}\t#{session_name}\t#{client_readonly}"]));
+    }
+    for (const line of inventories.get(key)!.trim().split("\n")) {
+      const [pid, session, readOnly] = line.split("\t");
+      if (!pid || !/^\d+$/.test(pid) || !session || !["0", "1"].includes(readOnly ?? "")) continue;
+      const modes = readOnly === "1" ? [["-r"]] : [[], ["-f", "ignore-size"]];
+      const matches = (argv ? [tmux] : ["tmux", tmux]).some(binary => modes.some(mode => {
+        const attach = ["attach", ...mode, "-t", session];
+        if (argv && JSON.stringify([binary, ...server, ...attach]) !== JSON.stringify(argv)) return false;
+        const words = [binary === "tmux" ? binary : attachQuote(binary), ...server.map((arg, i) => i === 0 ? arg : attachQuote(arg)),
+          "attach", ...mode, "-t", attachQuote(session)];
+        return words.join(" ") === (pane.recoveryCommand ?? pane.paneCommand);
+      }));
+      if (matches) {
+        if (!clients.has(pid)) clients.set(pid, new Set());
+        clients.get(pid)!.add(pane);
+      }
+    }
+  }
+  return clients;
+}
+
 /** Saved Herdr labels survive reboot; only current clients prove a local attachment. */
 async function hasLiveAttachments(existing: HerdrTab, tabs: HerdrTab[], pages: Pane[][], pageLabel: (index: number) => string, herdrArgs: string[], deps: WindowDeps): Promise<boolean> {
   try {
-    const tmux = (await deps.exec("/bin/sh", ["-c", "command -v tmux"])).trim();
-    if (!path.isAbsolute(tmux)) return false;
     const listed = JSON.parse(await deps.exec("/usr/bin/env", [...herdrArgs, "pane", "list", "--workspace", existing.workspace_id]));
     const panes = listed?.result?.panes as Array<{ workspace_id: string; tab_id: string; pane_id: string }> | undefined;
     if (!Array.isArray(panes) || !panes.every(pane => pane && pane.workspace_id === existing.workspace_id && typeof pane.tab_id === "string" && typeof pane.pane_id === "string" && pane.pane_id)) return false;
-    const clients = new Map<string, string[]>();
-    // Match view-composer's serialization (these strings are compared, never executed).
-    const quote = (value: string) => "'" + value.replace(/'/g, "'\"'\"'") + "'";
-    const inventory = await deps.exec(tmux, ["list-clients", "-F", "#{client_pid}\t#{session_name}\t#{client_readonly}"]);
-    for (const line of inventory.trim().split("\n")) {
-      const [pid, session, readOnly] = line.split("\t");
-      if (!pid || !/^\d+$/.test(pid) || !session || !["0", "1"].includes(readOnly ?? "")) continue;
-      // Compare the composer's exact command, including session aliases and read-only mode.
-      // SSH/custom commands cannot be confirmed from this local client inventory.
-      const flags = readOnly === "1" ? ["-r "] : ["", "-f ignore-size "];
-      clients.set(pid, ["tmux", quote(tmux)].flatMap(binary => flags.map(flag => `${binary} attach ${flag}-t ${quote(session)}`)));
-    }
+    const clients = await attachedPanes(pages, deps);
+    if (!clients) return false;
     const used = new Set<string>();
     for (const [index, page] of pages.entries()) {
       const label = pageLabel(index);
       const matches = tabs.filter(tab => tab.workspace_id === existing.workspace_id && tab.label === label);
       if (matches.length !== 1) return false;
-      const remaining = page.map(pane => pane.recoveryCommand ?? pane.paneCommand);
+      const remaining = [...page];
       for (const pane of panes.filter(pane => pane.tab_id === matches[0]!.tab_id)) {
         if (remaining.length === 0) break;
         const result = JSON.parse(await deps.exec("/usr/bin/env", [...herdrArgs, "pane", "process-info", "--pane", pane.pane_id]));
@@ -243,7 +284,7 @@ async function hasLiveAttachments(existing: HerdrTab, tabs: HerdrTab[], pages: P
         for (const process of info.foreground_processes ?? []) {
           const pid = String(process?.pid);
           if (used.has(pid)) continue;
-          const found = remaining.findIndex(command => clients.get(pid)?.includes(command));
+          const found = remaining.findIndex(expected => clients.get(pid)?.has(expected));
           if (found < 0) continue;
           remaining.splice(found, 1);
           used.add(pid);

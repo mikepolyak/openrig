@@ -107,7 +107,7 @@ describe("S08 — the rig opens as one Herdr space, 16 cells per tab", () => {
     const preview = await svc.previewView({ view: `rig:${RIG}` });
     if (!("composed" in preview)) throw new Error("expected preview");
     const res = await svc.openView({ view: `rig:${RIG}`, expectedPlan: preview.planId });
-    expect(res).toMatchObject({ provider: "herdr", ok: true, pages: 2, absent: [], degraded: [] });
+    expect(res).toMatchObject({ workspaceId: "w1", provider: "herdr", ok: true, pages: 2, absent: [], degraded: [] });
     expect(res.opened).toEqual(rows.map((r) => r.canonicalSessionName));
     const create = requests.find((r) => r.method === "workspace.create")!;
     expect(create.params).toEqual({ focus: false, label: RIG });

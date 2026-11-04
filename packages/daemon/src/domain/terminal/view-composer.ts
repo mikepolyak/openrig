@@ -203,6 +203,7 @@ export function composeView(
       label: m.label,
       paneCommand: attachArgv.map(shellQuote).join(" "),
       recoveryCommand: `${localTmux} attach ${attachFlag}-t ${shellQuote(m.tmuxSession)}`,
+      recoveryArgv: [ctx.localTmux ?? "tmux", ...(ctx.localTmuxServer ?? []), "attach", ...(m.readOnly ? ["-r"] : ["-f", "ignore-size"]), "-t", m.tmuxSession],
       attachArgv,
       readOnly: m.readOnly,
     });

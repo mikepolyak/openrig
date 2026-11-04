@@ -24,10 +24,20 @@ describe("the daemon's tmux server", () => {
     expect(tmuxServerArgs({}, 501)).toEqual([]);
     expect(tmuxServerArgs({ TMUX: "" }, 501)).toEqual([]);
     expect(tmuxServerArgs({ TMUX: " ,1,0" }, 501)).toEqual([]);
-    // Outside tmux the daemon shares the TMUX_TMPDIR of the shell that started it: today's form.
-    expect(tmuxServerArgs({ TMUX_TMPDIR: base }, 501)).toEqual([]);
     expect(tmuxServerArgs({ TMUX: `${standard}/default,123,0` }, 501)).toEqual([]);
     expect(tmuxServerArgs({ TMUX: `${standard}/default,123,0`, TMUX_TMPDIR: "/tmp" }, 501)).toEqual([]);
+  });
+
+  it("pins an external default socket even when the daemon started outside tmux", () => {
+    const external = join(base, "external volume");
+    const flags = tmuxServerArgs({ TMUX_TMPDIR: external }, 501);
+    expect(flags).toEqual(["-S", join(external, "tmux-501", "default")]);
+    expect(tmuxServerArgs({ TMUX_TMPDIR: "/tmp" }, 501)).toEqual([]);
+    const member: ViewMemberInput = { seat: "monitor", label: "monitor", tmuxSession: "monitor", host: null, readOnly: true, alive: true };
+    const view = composeView("v", [member], { resolveHost: () => null, localTmuxServer: flags });
+    expect(view.opened[0]!.recoveryCommand).toContain(`-S '${join(external, "tmux-501", "default")}' attach -r`);
+    expect(view.opened[0]!.attachArgv).toEqual(expect.arrayContaining(flags));
+    expect(view.opened[0]!.recoveryArgv).toEqual(["tmux", ...flags, "attach", "-r", "-t", "monitor"]);
   });
 
   it("names another socket in tmux's standard directory with -L, finding /tmp's real path", () => {

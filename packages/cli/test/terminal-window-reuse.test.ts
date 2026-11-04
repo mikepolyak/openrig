@@ -14,11 +14,11 @@ const planId = "0123456789abcdef".repeat(4);
 const label = (id = "kernel", token = "l1") => `openrig:${id}#${planId.slice(0, 16)}#${token}`;
 interface Tab { workspace_id: string; tab_id: string; label: string }
 const spaceLabels: Record<string, string> = { "openrig-kernel": "openrig kernel", "old-name": "switchboard" };
-function fixture(tabs: Tab[] = [], id = "kernel", session?: string) {
+function fixture(tabs: Tab[] = [], id = "kernel", session?: string, servers?: string[][]) {
   const socketPath = session === undefined ? "/daemon home/herdr.sock" : `/daemon home/sessions/${session}/herdr.sock`;
-  const panes = composeView(id, ["tui", "advisor", "operator"].map(seat => ({ seat, label: seat,
+  const panes = ["tui", "advisor", "operator"].flatMap((seat, index) => composeView(id, [{ seat, label: seat,
     tmuxSession: `fixture-${seat}`, host: null, readOnly: false, alive: true,
-  })), { resolveHost: () => null, localTmux: "/fixture/bin/tmux" }).opened;
+  }], { resolveHost: () => null, localTmux: "/fixture/bin/tmux", localTmuxServer: servers?.[index] }).opened);
   const composed = { id, opened: panes, pages: [panes], absent: [] as Array<{ seat: string; host: string | null; reason: string }>, degraded: [] as Array<{ seat: string; host: string; reason: string }> };
   const get = vi.fn(async (url: string) => ({ status: 200, data: url.includes("preview") ? {
     planId, composed, ...(session !== undefined ? { session } : {}),
@@ -38,12 +38,12 @@ function fixture(tabs: Tab[] = [], id = "kernel", session?: string) {
   const processInfo = vi.fn(async (paneId: string) => JSON.stringify({ result: { process_info: {
     pane_id: paneId, foreground_processes: [{ pid: 101 + panes.findIndex(pane => paneId.endsWith(`-${pane.seat}`)) }],
   } } }));
-  const clients = vi.fn(async () => panes.map((pane, i) => `${101 + i}\tfixture-${pane.seat}\t0`).join("\n"));
+  const clients = vi.fn(async (_args: string[]) => panes.map((pane, i) => `${101 + i}\tfixture-${pane.seat}\t0`).join("\n"));
   const exec = vi.fn(async (file: string, args: string[]) => {
     if (file === "/usr/bin/osascript") return "window-sized";
     if (args.includes("--version")) return "herdr 0.9.3";
     if (file === "/bin/sh") return args[1] === "command -v tmux" ? "/fixture/bin/tmux" : "/fixture/bin/herdr";
-    if (file === "/fixture/bin/tmux") return clients();
+    if (file === "/fixture/bin/tmux") return clients(args);
     if (args.includes("process-info")) return processInfo(args.at(-1)!);
     if (args.includes("pane")) return paneList(args.at(-1)!);
     if (file === "/usr/bin/env" && args.at(-2) === "workspace" && args.at(-1) === "list") return workspaces();
@@ -198,9 +198,34 @@ describe("reopening a Herdr view in a desktop window", () => {
     }
   });
 
+  it.each(["live", "wrong socket", "wrong access"])("checks each composed tmux server before reusing a Herdr view: %s", async state => {
+    const pinned = ["-S", "/Volumes/External Disk/tmux-501/default"];
+    const other = ["-L", "second-server"];
+    const f = fixture([{ workspace_id: "old", tab_id: "first", label: label() }], "kernel", undefined, [pinned, pinned, other]);
+    f.clients.mockImplementation(async args => {
+      if (args[0] === "-S" && args[1] === pinned[1]) {
+        const tui = state === "wrong socket" ? "" : `101\tfixture-tui\t${state === "wrong access" ? 1 : 0}\n`;
+        return `${tui}102\tfixture-advisor\t0`;
+      }
+      if (args[0] === "-L" && args[1] === other[1]) return "101\tfixture-tui\t0\n103\tfixture-operator\t0";
+      return "";
+    });
+    await f.run();
+    const inventory = ["list-clients", "-F", "#{client_pid}\t#{session_name}\t#{client_readonly}"];
+    expect(f.clients.mock.calls.map(([args]) => args)).toEqual([[...pinned, ...inventory], [...other, ...inventory]]);
+    if (state === "live") {
+      expect(f.focus).toHaveBeenCalledExactlyOnceWith("first");
+      expect(f.post).not.toHaveBeenCalled();
+    } else {
+      expect(f.focus).not.toHaveBeenCalled();
+      expect(f.post).toHaveBeenCalledTimes(1);
+    }
+  });
+
   it("also reuses live viewers with the legacy writable attach spelling", async () => {
     const f = fixture([{ workspace_id: "old", tab_id: "first", label: label() }]);
     for (const pane of f.composed.opened) {
+      delete pane.recoveryArgv; // An older daemon returned only the recovery command.
       pane.recoveryCommand = pane.recoveryCommand!.replace("-f ignore-size ", "");
     }
     await f.run();
@@ -210,6 +235,7 @@ describe("reopening a Herdr view in a desktop window", () => {
 
   it("confirms an absolute tmux command, quoted session alias and read-only attachment", async () => {
     const f = fixture([{ workspace_id: "old", tab_id: "first", label: label() }]);
+    delete f.composed.opened[0]!.recoveryArgv;
     f.composed.opened[0]!.recoveryCommand = "'/fixture/bin/tmux' attach -r -t 'alias'\"'\"'s session'";
     f.clients.mockResolvedValue("101\talias's session\t1\n102\tfixture-advisor\t0\n103\tfixture-operator\t0");
     await f.run();

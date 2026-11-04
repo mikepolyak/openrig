@@ -675,6 +675,7 @@ export class HerdrAdapter implements TerminalProvider {
     await reportResumeCommands(this.transport, resumeReports, unmatchedResume, this.deps.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms))), notes);
 
     return {
+      workspaceId,
       provider: this.name,
       ok: opened.length > 0 || view.opened.length === 0,
       opened,
