@@ -92,6 +92,45 @@ interpret successful submission as completion, accept findings automatically, or
 record an app message as delivered. The app-side consumer must reconcile its own
 message delivery using task/result identities and report hashes.
 
+## Return a report across hosts
+
+After a worker has claimed the source job and written its report, it must return
+the work with one native `queue handoff`. Run it in the worker seat against the
+worker's daemon. `ORIGIN_ALIAS` is that daemon's registered alias for the
+control host. Use a short result summary as the body and a stable reference to
+the preserved report as evidence.
+
+```sh
+rig queue handoff "$SOURCE_JOB_ID" --to "$CONTROL_SEAT" --host "$ORIGIN_ALIAS" \
+  --body-file "$REPORT_SUMMARY_FILE" --summary "$RESULT_SUBJECT" \
+  --evidence-ref "$REPORT_REF" --full --json
+```
+
+Save the receipt. OpenRig derives `created.qitemId` from the source job ID,
+destination seat and exact host alias. It first creates the successor on the
+control host, appending the source job ID to its `chainOfRecord`. It then
+marks the source `handed-off` with a `closureTarget` of
+`<created.qitemId>@<ORIGIN_ALIAS>`. Creating a separate result row and manually
+closing the source against a bare ID omits this link and can trigger false
+custody recovery.
+
+A later custody check can still ask for verification on the named host. Read
+that successor ID on the control daemon and retain the receipt. If the receiver
+is unavailable, leave custody unverified until it can answer.
+
+If the response is lost, read the source on the worker daemon and the bound
+seat's inbox on the control daemon. For a partial handoff, retry the same
+command with the same source, destination, exact host alias, body and evidence.
+The native retry reuses the successor ID. A conflicting existing close must be
+investigated before taking further action.
+
+On the control host, read `rig queue show "$RESULT_ID" --full --json` using the
+actual `created.qitemId`. Confirm its destination and source job in
+`chainOfRecord`. Retrieve and verify the referenced report, then run the
+adapter's `accept --id "$RESULT_ID"` with the reviewer's resolution. A handoff
+records custody of the queue row. Report transfer, acceptance and delivery to
+the chat each need their own evidence.
+
 ## Deployment and verification
 
 1. Build the pinned OpenRig source with its documented `npm ci` and `npm run build`.
