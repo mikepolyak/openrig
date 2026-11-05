@@ -1,6 +1,6 @@
 # Herdr monitor status
 
-Show OpenRig's current seat observation on dedicated Herdr viewers. A desktop
+Show OpenRig's current seat or whole-rig observation on dedicated Herdr viewers. A desktop
 control chat can be a hosted roster member with no observed process. A registered
 worker can have a running process, an idle prompt and outstanding queue rows at
 the same time. The integration keeps those facts separate.
@@ -46,6 +46,45 @@ uses placeholder identities and paths. Supply the actual values from each open.
 `host` is the worker host's registered alias. `hostId` is its daemon's durable
 self ID. Both are checked through the native worker read. For a hosted member,
 use the host and roster containing the bound seat.
+
+## Monitor every managed seat on a Mac
+
+Use `kind: "fleet"` for a rig dashboard instead of treating one worker as the
+status of the entire Mac. The pane/process identity fields stay the same. Supply
+the expected managed seats explicitly so a missing worker remains visible as
+unknown. All additional native seats in the rig are included automatically.
+
+```json
+{
+  "kind": "fleet", "label": "Worker Mac",
+  "workspaceId": "w1", "paneId": "w1:p2", "terminalId": "term-worker",
+  "foregroundArgv": ["/installed/bin/tmux", "attach-session", "-r", "-t", "fleet-view"],
+  "host": "worker-host", "hostId": "host-worker", "rig": "workers",
+  "expectedSeats": ["audit@workers", "build@workers", "review@workers"]
+}
+```
+
+Omit `host` to query the local daemon; remote reads use the registered alias.
+The read checks every row against the expected daemon ID and rig, and refuses
+truncated or duplicate identities. The title shows managed-seat totals and
+working/idle/input/unknown counts. `openrig_queue` is the sum of native
+pending/in-progress/blocked rows only when every seat has known counts.
+`openrig_seat_1`, `openrig_seat_2`, etc. carry each canonical seat's activity and
+queue counts. The compact `openrig_counts` token carries working/idle/unknown/stopped/input
+counts. Herdr permits at most 16 tokens per metadata report, so pane metadata
+previews up to six seats and `openrig_details` states the displayed/total count.
+The native fleet dashboard and synchronization receipt retain the full roster.
+
+A missing, stopped or stale seat prevents an all-idle aggregate. Fresh input
+arbitration takes precedence, while the counts continue to expose unknown
+members. The oldest native activity sample controls metadata expiry. Hosted
+chat membership is separate from managed seats and remains **activity
+unobserved**; use the existing hosted viewer when that identity needs its own
+label. A fleet dashboard does not infer activity for the control chat.
+
+After upgrading monitor source, restart only the recorded, exactly verified
+watcher so it loads the new module; a binding-only update is read on the next
+cycle without a restart.
 
 ## Run
 

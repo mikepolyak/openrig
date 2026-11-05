@@ -35,8 +35,15 @@ export function readBinding(filename) {
     requireThat([v.workspaceId, v.paneId, v.terminalId, v.hostId].every(safeId) && !paneIds.has(v.paneId), 'Invalid or repeated viewer identity');
     paneIds.add(v.paneId);
     requireThat(typeof v.label === 'string' && v.label.length > 0 && v.label.length <= 40 && !/[\x00-\x1f\x7f]/.test(v.label), 'Invalid display label');
-    requireThat(seatName.test(v.seat) && (v.kind === 'hosted' ? safeId(v.roster) :
-      v.kind === 'worker' && safeId(v.host) && safeId(v.rig) && v.rig === v.seat.split('@')[1]), 'Invalid seat observation target');
+    if (v.kind === 'fleet') {
+      requireThat(safeId(v.rig) && (v.host === undefined || safeId(v.host))
+        && Array.isArray(v.expectedSeats) && v.expectedSeats.length > 0 && v.expectedSeats.length <= 32
+        && new Set(v.expectedSeats).size === v.expectedSeats.length
+        && v.expectedSeats.every(seat => seatName.test(seat) && seat.split('@')[1] === v.rig), 'Invalid fleet observation target');
+    } else {
+      requireThat(seatName.test(v.seat) && (v.kind === 'hosted' ? safeId(v.roster) :
+        v.kind === 'worker' && safeId(v.host) && safeId(v.rig) && v.rig === v.seat.split('@')[1]), 'Invalid seat observation target');
+    }
     requireThat(Array.isArray(v.foregroundArgv) && v.foregroundArgv.length > 0 && path.isAbsolute(v.foregroundArgv[0])
       && v.foregroundArgv.every((a) => typeof a === 'string' && a.length > 0 && !a.includes('\0')), 'Exact foreground argv required');
   }
@@ -69,6 +76,37 @@ export function workerStatus(viewer, json, now, maxAgeMs) {
   return state ? { state, reason: activity.reason ?? 'OpenRig observation', ...detail } : unknown('activity unknown', detail);
 }
 
+// An explicit expected roster prevents a missing seat from looking like an idle
+// fleet. Unexpected seats are included too, so a new worker cannot disappear
+// behind the monitor's saved configuration.
+export function fleetStatus(viewer, json, now, maxAgeMs) {
+  const rows = Array.isArray(json) ? json : json?.entries;
+  if (!Array.isArray(rows) || json.truncated || (json.totalNodes !== undefined && json.totalNodes !== rows.length)) return unknown('fleet unavailable');
+  if (rows.some(row => row.hostSelfId !== viewer.hostId || row.rigName !== viewer.rig
+    || !seatName.test(row.canonicalSessionName) || row.canonicalSessionName.split('@')[1] !== viewer.rig)
+    || new Set(rows.map(row => row.canonicalSessionName)).size !== rows.length) return unknown('fleet identity changed');
+  const names = [...new Set([...viewer.expectedSeats, ...rows.map(row => row.canonicalSessionName)])];
+  const seats = names.map(seat => {
+    const row = rows.find(row => row.canonicalSessionName === seat);
+    return { seat, ...workerStatus({ ...viewer, seat }, row ? [row] : [], now, maxAgeMs) };
+  });
+  const counts = { working: 0, idle: 0, unknown: 0, stopped: 0, needsInput: 0 };
+  for (const seat of seats) {
+    counts[seat.state === 'needs input' ? 'needsInput' : seat.state]++;
+    if (seat.lifecycle && seat.lifecycle !== 'running' && seat.lifecycle !== 'unknown') counts.stopped++;
+  }
+  const state = counts.needsInput ? 'needs input' : counts.unknown ? 'unknown' : counts.working ? 'working' : 'idle';
+  const summary = [names.length + ' seats', counts.working && counts.working + ' working', counts.idle && counts.idle + ' idle',
+    counts.needsInput && counts.needsInput + ' need input', counts.unknown && counts.unknown + ' unknown'].filter(Boolean).join(' · ');
+  const queues = seats.map(seat => seat.queue?.split('/').map(Number));
+  const queue = queues.every(parts => parts?.length === 3 && parts.every(Number.isInteger))
+    ? [0, 1, 2].map(i => queues.reduce((sum, parts) => sum + parts[i], 0)).join('/') : 'unknown';
+  // Expiry follows the oldest native sample, never just the time of this poll.
+  const samples = seats.map(seat => Date.parse(seat.sampledAt)).filter(Number.isFinite);
+  return { state, reason: 'native managed seat observations', summary, queue, counts, seats,
+    ...(samples.length ? { sampledAt: new Date(Math.min(...samples)).toISOString() } : {}), basis: 'native per-seat observations' };
+}
+
 export function hostedStatus(viewer, json) {
   const members = json?.roster?.members;
   const matches = Array.isArray(members) ? members.filter((m) => m.seat === viewer.seat && m.host === viewer.hostId) : [];
@@ -79,6 +117,10 @@ export function hostedStatus(viewer, json) {
 async function readStatus(config, viewer, client, now) {
   try {
     if (viewer.kind === 'hosted') return hostedStatus(viewer, await client.rig(['roster', 'show', viewer.roster, '--json']));
+    if (viewer.kind === 'fleet') {
+      const result = await client.rig(['ps', ...(viewer.host ? ['--host', viewer.host] : []), '--nodes', '--rig', viewer.rig, '--json', '--fields', fields]);
+      return fleetStatus(viewer, result, now(), config.maxAgeMs);
+    }
     const result = await client.rig(['ps', '--host', viewer.host, '--nodes', '--rig', viewer.rig, '--session', viewer.seat, '--json', '--fields', fields]);
     return workerStatus(viewer, result, now(), config.maxAgeMs);
   } catch {
@@ -103,14 +145,26 @@ function textField(value) {
 }
 
 function presentation(v, state, seq, expiresInMs) {
-  const summary = state.hosted ? state.reason : state.state === 'unknown' ? 'unknown · ' + state.reason : state.state;
+  const summary = state.summary ?? (state.hosted ? state.reason : state.state === 'unknown' ? 'unknown · ' + state.reason : state.state);
   const title = textField(v.label + ' · ' + summary);
   const tokens = {
-    openrig_role: v.kind, openrig_seat: v.seat, openrig_host: v.hostId, openrig_state: state.state,
+    openrig_role: v.kind, openrig_seat: v.kind === 'fleet' ? v.rig : v.seat, openrig_host: v.hostId, openrig_state: state.state,
     openrig_reason: state.reason, openrig_sample: state.sampledAt ?? 'unobserved',
     openrig_queue: state.queue ?? 'unobserved', openrig_basis: state.basis ?? 'unobserved',
     openrig_update: String(seq)
   };
+  if (v.kind === 'fleet') {
+    // Herdr accepts at most 16 tokens per metadata report. Keep the aggregate
+    // and a bounded seat preview; the native dashboard and receipt retain all.
+    delete tokens.openrig_basis;
+    delete tokens.openrig_update;
+    tokens.openrig_seats = String(state.seats?.length ?? 'unknown');
+    tokens.openrig_counts = state.counts ? ['working', 'idle', 'unknown', 'stopped', 'needsInput']
+      .map(key => key.replace('needsInput', 'input') + ':' + state.counts[key]).join(' ') : 'unknown';
+    const visible = state.seats?.slice(0, 6) ?? [];
+    tokens.openrig_details = visible.length + '/' + (state.seats?.length ?? 'unknown') + ' seats; full list in fleet dashboard';
+    visible.forEach((seat, i) => { tokens['openrig_seat_' + (i + 1)] = seat.seat + ' · ' + seat.state + ' · q' + (seat.queue ?? 'unknown'); });
+  }
   const args = ['pane', 'report-metadata', v.paneId, '--source', SOURCE, '--title', title, '--seq', String(seq), '--ttl-ms', String(expiresInMs)];
   const labels = {};
   for (const nativeState of ['idle', 'working', 'blocked', 'done', 'unknown']) {
@@ -152,7 +206,7 @@ export async function synchronize(config, { client = nativeClient(config), now =
       let ttl = config.intervalMs * 3;
       if (state.sampledAt) {
         const remaining = Date.parse(state.sampledAt) + config.maxAgeMs - now();
-        if (remaining <= 0) state = { ...state, ...unknown('activity stale or unavailable') };
+        if (remaining <= 0) state = { ...state, ...unknown('activity stale or unavailable'), summary: undefined, counts: undefined, seats: undefined };
         else ttl = Math.min(ttl, remaining);
       }
       if (dryRun) return { ...identity(), verified: true, published: false };

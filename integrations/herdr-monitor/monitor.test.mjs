@@ -1,6 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { synchronize, workerStatus, hostedStatus, nativeClient, watch } from './monitor.mjs';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { synchronize, workerStatus, hostedStatus, nativeClient, watch, fleetStatus, readBinding } from './monitor.mjs';
 
 const now = Date.parse('2026-01-01T12:00:00Z');
 const time = () => now;
@@ -23,6 +26,7 @@ function clientFor(viewer, data) {
     pane: async () => pane,
     process: async () => ({ pane_id: viewer.paneId, foreground_processes: [{ argv: viewer.foregroundArgv }] }),
     publish: async (args) => {
+      assert.ok(args.filter(arg => arg === '--token').length <= 16, 'Herdr permits at most 16 metadata tokens');
       calls.push(['publish', args]); pane.title = flag(args, '--title');
       for (let i = 0; i < args.length; i++) {
         if (args[i] === '--token' || args[i] === '--state-label') {
@@ -114,4 +118,93 @@ test('watch rereads replaced bindings, recovers from bad reads, and exits withou
     tick: async (config) => ({ ok: true, revision: config.revision }), emit: (v) => { seen.push(v); if (seen.length === 3) ac.abort(); },
     sleep: async () => {} });
   assert.deepEqual(seen, [{ ok: false, error: 'bad mapping' }, { ok: true, revision: 2 }, { ok: true, revision: 3 }]);
+});
+
+
+const fleet = { ...v, kind: 'fleet', label: 'Remote fleet', expectedSeats: [v.seat, 'build@work'] };
+const builder = { ...row, canonicalSessionName: 'build@work', agentActivity: { ...activity, state: 'running' },
+  pendingWorkCount: 2, inProgressWorkCount: 0, blockedWorkCount: 0 };
+
+test('fleet aggregates actual activity independently of queue ownership and includes every seat', () => {
+  const out = fleetStatus(fleet, [row, builder], now, b.maxAgeMs);
+  assert.equal(out.state, 'working'); assert.equal(out.queue, '2/1/2');
+  assert.equal(out.summary, '2 seats · 1 working · 1 idle');
+  assert.deepEqual(out.counts, { working: 1, idle: 1, unknown: 0, stopped: 0, needsInput: 0 });
+  const added = { ...builder, canonicalSessionName: 'review@work', agentActivity: activity };
+  assert.equal(fleetStatus(fleet, [row, builder, added], now, b.maxAgeMs).seats.length, 3);
+});
+
+test('missing, stale and stopped fleet members cannot produce an all-idle report', () => {
+  for (const rows of [[], [row], [row, { ...builder, agentActivity: { ...activity, sampledAt: 'bad' } }],
+    [row, { ...builder, lifecycleState: 'stopped' }]]) {
+    const out = fleetStatus(fleet, rows, now, b.maxAgeMs);
+    assert.equal(out.state, 'unknown'); assert.ok(out.counts.unknown > 0); assert.match(out.summary, /unknown/);
+  }
+  assert.equal(fleetStatus(fleet, [row, { ...builder, lifecycleState: 'stopped' }], now, b.maxAgeMs).counts.stopped, 1);
+  assert.equal(fleetStatus(fleet, [row], now, b.maxAgeMs).queue, 'unknown');
+});
+
+test('fleet rejects truncated, duplicated and foreign rows and surfaces fresh input arbitration', () => {
+  for (const data of [{ entries: [row], truncated: true }, { entries: [row], totalNodes: 2 }, [row, row],
+    [row, { ...builder, hostSelfId: 'foreign' }], [row, { ...builder, rigName: 'other' }],
+    [row, { ...builder, canonicalSessionName: 'build@other' }]]) {
+    const out = fleetStatus(fleet, data, now, b.maxAgeMs);
+    assert.equal(out.state, 'unknown'); assert.equal(out.seats, undefined);
+  }
+  const input = fleetStatus(fleet, [row, { ...builder, arbitratedNeedsInput: true }], now, b.maxAgeMs);
+  assert.equal(input.state, 'needs input'); assert.equal(input.counts.needsInput, 1);
+});
+
+test('fleet publication queries one complete rig, reports per-seat detail and expires at oldest native sample', async () => {
+  const older = { ...row, agentActivity: { ...activity, sampledAt: new Date(now - 29000).toISOString() } };
+  const c = clientFor(fleet, [older, builder]);
+  const out = await synchronize({ ...b, viewers: [fleet] }, { client: c, now: time });
+  assert.equal(out.ok, true); assert.equal(c.stored.tokens.openrig_role, 'fleet');
+  assert.equal(c.stored.tokens.openrig_counts, 'working:1 idle:1 unknown:0 stopped:0 input:0');
+  assert.equal(c.stored.tokens.openrig_queue, '2/1/2'); assert.equal(c.stored.tokens.openrig_seat_1, 'audit@work · idle · q0/1/2');
+  assert.equal(c.stored.tokens.openrig_seat_2, 'build@work · working · q2/0/0');
+  assert.equal(flag(c.calls[1][1], '--ttl-ms'), '1000');
+  assert.deepEqual(c.calls[0][1].slice(0, 7), ['ps', '--host', 'peer', '--nodes', '--rig', 'work', '--json']);
+  assert.equal(c.calls[0][1].includes('--session'), false);
+  const local = { ...fleet }; delete local.host;
+  const l = clientFor(local, [row, builder]);
+  await synchronize({ ...b, viewers: [local] }, { client: l, now: time });
+  assert.deepEqual(l.calls[0][1].slice(0, 5), ['ps', '--nodes', '--rig', 'work', '--json']);
+});
+
+test('fleet crossing sample expiry during viewer verification discards activity and counts', async () => {
+  const c = clientFor(fleet, [row, builder]); let ticks = 0;
+  await synchronize({ ...b, viewers: [fleet] }, { client: c, now: () => now + (ticks++ < 2 ? 0 : 30001) });
+  assert.equal(c.stored.tokens.openrig_state, 'unknown'); assert.equal(c.stored.tokens.openrig_counts, 'unknown');
+  assert.match(c.stored.title, /unknown/); assert.doesNotMatch(c.stored.title, /working/);
+});
+
+test('private fleet binding requires an explicit unique expected roster scoped to its rig', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'openrig-monitor-test-'));
+  try {
+    const filename = path.join(directory, 'binding.json');
+    const config = { ...b, version: 1, session: 'default', rig: process.execPath, herdr: process.execPath,
+      localUrl: 'http://127.0.0.1:7433', viewers: [fleet] };
+    const read = (viewer) => {
+      fs.writeFileSync(filename, JSON.stringify({ ...config, viewers: [viewer] }), { mode: 0o600 });
+      return readBinding(filename);
+    };
+    assert.equal(read(fleet).viewers[0].kind, 'fleet');
+    for (const expectedSeats of [undefined, [], [v.seat, v.seat], ['wrong@other'], ['not-a-seat']])
+      assert.throws(() => read({ ...fleet, expectedSeats }), /Invalid fleet/);
+    assert.throws(() => read({ ...fleet, host: '../peer' }), /Invalid fleet/);
+  } finally { fs.rmSync(directory, { recursive: true }); }
+});
+
+
+test('large fleet metadata fits Herdr token budget and explicitly marks preview coverage', async () => {
+  const rows = Array.from({ length: 12 }, (_, i) => ({ ...row, canonicalSessionName: 'seat' + i + '@work' }));
+  const large = { ...fleet, expectedSeats: rows.map(row => row.canonicalSessionName) };
+  const c = clientFor(large, rows);
+  const out = await synchronize({ ...b, viewers: [large] }, { client: c, now: time });
+  assert.equal(out.ok, true); assert.equal(out.results[0].seats.length, 12);
+  assert.equal(Object.keys(c.stored.tokens).length, 16);
+  assert.equal(c.stored.tokens.openrig_seats, '12');
+  assert.equal(c.stored.tokens.openrig_details, '6/12 seats; full list in fleet dashboard');
+  assert.equal(c.stored.tokens.openrig_seat_7, undefined);
 });
