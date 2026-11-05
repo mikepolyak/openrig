@@ -106,6 +106,8 @@ rig queue handoff "$SOURCE_JOB_ID" --to "$CONTROL_SEAT" --host "$ORIGIN_ALIAS" \
   --evidence-ref "$REPORT_REF" --full --json
 ```
 
+For a hosted control seat deliberately polled by an app heartbeat, add `--no-nudge` to this result handoff. This records intentional cold-queue delivery instead of a failed terminal wake. Keep normal nudges for managed worker destinations; do not disable fleet recovery or register a dummy wake receiver.
+
 Save the receipt. OpenRig derives `created.qitemId` from the source job ID,
 destination seat and exact host alias. It first creates the successor on the
 control host, appending the source job ID to its `chainOfRecord`. It then
